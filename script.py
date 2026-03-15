@@ -2,48 +2,120 @@ import requests
 import os
 import csv
 from dotenv import load_dotenv
+import snowflake.connector
 
 load_dotenv()
 
 POLYGON_API_KEY = os.getenv('POLYGON_API_KEY')
-LIMIT = 20
-url = f"https://api.massive.com/v3/reference/tickers?market=stocks&active=true&order=asc&limit={LIMIT}&sort=ticker&apiKey={POLYGON_API_KEY}"
-response = requests.get(url)
-tickers = []
+LIMIT = 1000
+API_CALLS_PER_MINUTE = 5
 
-data = response.json()
+def load_stock_tickers_job():
+    url = f"https://api.massive.com/v3/reference/tickers?market=stocks&active=true&order=asc&limit={LIMIT}&sort=ticker&apiKey={POLYGON_API_KEY}"
+    response = requests.get(url)
+    tickers = []
 
-for ticker in data['results']:
-    tickers.append(ticker)
+    if response.status_code >= 400:
+        print(f"Initial request failed ({response.status_code}): {response.text}")
+        return []
 
-while 'next_url' in data:
-    print('next page')
-    response = requests.get(data['next_url'] + f'&apiKey={POLYGON_API_KEY}')
     data = response.json()
-    print(data)
     for ticker in data['results']:
         tickers.append(ticker)
 
-sample_ticker = {
-    'ticker': 'HBB', 
-    'name': 'Hamilton Beach Brands Holding Company Class A Common Stock', 
-    'market': 'stocks', 
-    'locale': 'us', 
-    'primary_exchange': 'XNYS', 
-    'type': 'CS', 
-    'active': True, 
-    'currency_name': 'usd', 
-    'cik': '0001709164', 
-    'composite_figi': 'BBG00HJ4P620', 
-    'share_class_figi': 'BBG00HJ4P6S2', 
-    'last_updated_utc': '2026-03-13T06:07:59.481403843Z'
-    }
+    while 'next_url' in data:
+        print('next page')
+        response = requests.get(data['next_url'] + f'&apiKey={POLYGON_API_KEY}')
+        if response.status_code >= 400:
+            print(f"Stopping after status {response.status_code}: {response.text}")
+            break
+        data = response.json()
+        print('next page')
+        for ticker in data['results']:
+            tickers.append(ticker)
 
-headers = sample_ticker.keys()
-output_csv = 'tickers.csv'
-with open(output_csv, 'w', newline='') as csvfile:
-    writer = csv.DictWriter(csvfile, fieldnames=headers)
-    writer.writeheader()
-    for ticker in tickers:
-        row = {key: ticker[key] for key in headers}
-        writer.writerow(row)
+    print(f"{len(tickers)} tickers loaded")
+    return tickers
+
+def dump_to_csv(data):
+    sample_ticker = {
+        'ticker': 'HBB', 
+        'name': 'Hamilton Beach Brands Holding Company Class A Common Stock', 
+        'market': 'stocks', 
+        'locale': 'us', 
+        'primary_exchange': 'XNYS', 
+        'type': 'CS', 
+        'active': True, 
+        'currency_name': 'usd', 
+        'cik': '0001709164', 
+        'composite_figi': 'BBG00HJ4P620', 
+        'share_class_figi': 'BBG00HJ4P6S2', 
+        'last_updated_utc': '2026-03-13T06:07:59.481403843Z'
+        }
+    headers = sample_ticker.keys()
+    output_csv = 'tickers.csv'
+    with open(output_csv, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=headers)
+        writer.writeheader()
+        for ticker in data:
+            row = {key: ticker.get(key, '') for key in headers}
+            writer.writerow(row)
+    print(f"{len(data)} loaded to csv")
+
+def load_to_snowflake(data):
+    connect_kwargs = {
+        'user': os.getenv('SNOWFLAKE_USER'),
+        'password': os.getenv('SNOWFLAKE_PW'),
+        'account': os.getenv('SNOWFLAKE_ACCOUNT'),
+        'warehouse': os.getenv('SNOWFLAKE_WAREHOUSE'),
+        'database': os.getenv('SNOWFLAKE_DATABASE'),
+        'schema': os.getenv('SNOWFLAKE_SCHEMA'),
+    }
+    conn = snowflake.connector.connect(**connect_kwargs)
+    cursor = conn.cursor()
+    
+    # Ensure all required keys are present in each ticker dict
+    required_keys = ['ticker', 'name', 'market', 'locale', 'primary_exchange', 'type', 'active', 'currency_name', 'cik', 'composite_figi', 'share_class_figi', 'last_updated_utc']
+    for ticker in data:
+        for key in required_keys:
+            ticker.setdefault(key, '')
+    
+    insert_query = """
+        INSERT INTO stock_tickers (
+            ticker, 
+            name, 
+            market, 
+            locale, 
+            primary_exchange, 
+            type, 
+            active, 
+            currency_name, 
+            cik, 
+            composite_figi, 
+            share_class_figi, 
+            last_updated_utc
+        )
+        VALUES (
+            %(ticker)s, 
+            %(name)s, 
+            %(market)s, 
+            %(locale)s, 
+            %(primary_exchange)s, 
+            %(type)s, 
+            %(active)s, 
+            %(currency_name)s, 
+            %(cik)s, 
+            %(composite_figi)s, 
+            %(share_class_figi)s, 
+            %(last_updated_utc)s
+            )
+    """
+    cursor.executemany(insert_query, data)
+    conn.commit()
+    cursor.close()
+    conn.close()
+    print(f"{len(data)} loaded to snowflake")
+
+if __name__ == "__main__":
+    data = load_stock_tickers_job()
+    load_to_snowflake(data)
