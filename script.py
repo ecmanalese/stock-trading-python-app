@@ -3,6 +3,7 @@ import os
 import csv
 from dotenv import load_dotenv
 import snowflake.connector
+from datetime import datetime
 
 load_dotenv()
 
@@ -11,6 +12,7 @@ LIMIT = 1000
 API_CALLS_PER_MINUTE = 5
 
 def load_stock_tickers_job():
+    datestamp = datetime.now().strftime('%Y-%m-%d')
     url = f"https://api.massive.com/v3/reference/tickers?market=stocks&active=true&order=asc&limit={LIMIT}&sort=ticker&apiKey={POLYGON_API_KEY}"
     response = requests.get(url)
     tickers = []
@@ -21,18 +23,21 @@ def load_stock_tickers_job():
 
     data = response.json()
     for ticker in data['results']:
+        ticker['datestamp'] = datestamp
         tickers.append(ticker)
+    print(f"Loaded {len(tickers)} tickers")
 
     while 'next_url' in data:
-        print('next page')
         response = requests.get(data['next_url'] + f'&apiKey={POLYGON_API_KEY}')
         if response.status_code >= 400:
             print(f"Stopping after status {response.status_code}: {response.text}")
             break
         data = response.json()
-        print('next page')
         for ticker in data['results']:
+            ticker['datestamp'] = datestamp
             tickers.append(ticker)
+        print(f"Loaded {len(tickers)} tickers")
+        print('Loading next page')
 
     print(f"{len(tickers)} tickers loaded")
     return tickers
@@ -73,9 +78,28 @@ def load_to_snowflake(data):
     }
     conn = snowflake.connector.connect(**connect_kwargs)
     cursor = conn.cursor()
+
+    create_table_query = """
+        CREATE TABLE IF NOT EXISTS stock_tickers (
+            ticker VARCHAR, 
+            name VARCHAR,
+            market VARCHAR,
+            locale VARCHAR,
+            primary_exchange VARCHAR,
+            type VARCHAR, 
+            active BOOLEAN,
+            currency_name VARCHAR,
+            cik VARCHAR,
+            composite_figi VARCHAR,
+            share_class_figi VARCHAR,
+            last_updated_utc TIMESTAMP,
+            datestamp DATE);
+        """
+    
+    cursor.execute(create_table_query)
     
     # Ensure all required keys are present in each ticker dict
-    required_keys = ['ticker', 'name', 'market', 'locale', 'primary_exchange', 'type', 'active', 'currency_name', 'cik', 'composite_figi', 'share_class_figi', 'last_updated_utc']
+    required_keys = ['ticker', 'name', 'market', 'locale', 'primary_exchange', 'type', 'active', 'currency_name', 'cik', 'composite_figi', 'share_class_figi', 'last_updated_utc', 'datestamp']
     for ticker in data:
         for key in required_keys:
             ticker.setdefault(key, '')
@@ -93,7 +117,8 @@ def load_to_snowflake(data):
             cik, 
             composite_figi, 
             share_class_figi, 
-            last_updated_utc
+            last_updated_utc,
+            datestamp
         )
         VALUES (
             %(ticker)s, 
@@ -107,7 +132,8 @@ def load_to_snowflake(data):
             %(cik)s, 
             %(composite_figi)s, 
             %(share_class_figi)s, 
-            %(last_updated_utc)s
+            %(last_updated_utc)s,
+            %(datestamp)s
             )
     """
     cursor.executemany(insert_query, data)
